@@ -1,6 +1,6 @@
 {
   "name": "dsh-sentry-telemetry",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Sentry error and trace telemetry for DeepSeek Harness Host and Web Client",
   "type": "module",
   "main": "./lib/index.js",
