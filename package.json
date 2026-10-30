@@ -1,7 +1,11 @@
 {
   "name": "dsh-sentry-telemetry",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Sentry error and trace telemetry for DeepSeek Harness Host and Web Client",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrThanlon/dsh-sentry-telemetry.git"
+  },
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
