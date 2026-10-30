@@ -21,6 +21,11 @@ const HOST_EXTERNALS = new Set([
   '@deepseek-ai/cordis',
 ])
 
+function formatSourceMapPath(relativeSourcePath: string): string {
+  const normalized = relativeSourcePath.replace(/\\/g, '/').replace(/^(?:\.\.?\/)+/, '')
+  return `/${PACKAGE_ID}/${normalized}`
+}
+
 export default defineConfig([
   {
     name: `${PACKAGE_ID}/host`,
@@ -38,6 +43,7 @@ export default defineConfig([
     },
     outputOptions: {
       sourcemapExcludeSources: false,
+      sourcemapPathTransform: formatSourceMapPath,
     },
     deps: {
       onlyBundle: false,
@@ -68,6 +74,7 @@ export default defineConfig([
     outputOptions: {
       entryFileNames: 'client.js',
       sourcemapExcludeSources: false,
+      sourcemapPathTransform: formatSourceMapPath,
       banner: () => `window.__ModuleLoader__.load({ id: ${JSON.stringify(PACKAGE_ID)}, factory: (require) => {`,
       intro: 'var module = { exports: {} }; var exports = module.exports;',
       footer: 'return module.exports; } });',

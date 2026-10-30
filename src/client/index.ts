@@ -3,9 +3,9 @@
  *
  * - Reads and edits `sentry-telemetry` settings live via `ctx.configForms`.
  * - Initializes `@sentry/browser` (`BrowserClient`) dynamically when DSN is configured.
- * - Resolves same-origin Source Map v3 (including DSH's Indexed Combo Source Maps) in-browser
- *   so every Error frame and Trace Span sent to Sentry carries original `.ts`/`.tsx` file paths,
- *   exact line numbers, and `pre_context`/`context_line`/`post_context` source code snippets.
+ * - Resolves same-origin Source Map v3 (including DSH's `plugins/??...` Indexed Combo Source Maps)
+ *   in-browser so every Error frame and Trace Span sent to Sentry carries original `.ts`/`.tsx`
+ *   file paths, exact line numbers, and `pre_context`/`context_line`/`post_context` source code snippets.
  * - Captures React Slot/Factory crashes contained by `SlotErrorBoundary` (`ctx.slots.onEntryError`).
  * - Captures Client Cordis `ctx.logger.error` records and browser unhandled errors/rejections.
  * - Wraps `ctx.connection.rpc.call` to record `rpc.client` spans, propagate `sentry-trace` and
@@ -89,18 +89,87 @@ function toError(value: unknown): Error {
   return new Error(typeof value === 'string' ? value : JSON.stringify(value))
 }
 
-/** Derive the `.map` endpoint URL for a DSH `/plugins/...` or Vite `/assets/...` script URL. */
-function toSourceMapUrl(scriptUrl: string): string | undefined {
+/** Convert a single script URL (combo `plugins/??...` or regular `.js`) into its `.map` URL. */
+function scriptUrlToMapUrl(scriptUrl: string): string | undefined {
   try {
-    const baseOrigin = typeof location !== 'undefined' ? location.origin : 'http://127.0.0.1'
-    const parsed = new URL(scriptUrl, baseOrigin)
-    if (typeof location !== 'undefined' && parsed.origin !== location.origin) return undefined
-    if (!parsed.pathname.endsWith('.js')) return undefined
-    parsed.pathname = `${parsed.pathname}.map`
-    return parsed.href
+    const baseHref = typeof location !== 'undefined' ? location.href : 'http://127.0.0.1/'
+    const parsed = new URL(scriptUrl, baseHref)
+    if (typeof location !== 'undefined' && parsed.protocol !== location.protocol) return undefined
+    // 1. DSH combo URL: `/plugins/??pkg1/client.js,pkg2/client.js&rev=xxx`
+    if (parsed.search.startsWith('??') && parsed.search.includes('/client.js')) {
+      parsed.search = parsed.search.replace(/\/client\.js(?=[,&])/g, '/client.js.map')
+      return parsed.href
+    }
+    // 2. Ordinary `.js` script or chunk: `/assets/index-xxx.js` or `/plugins/<id>/client.chunk.js?rev=xxx`
+    if (parsed.pathname.endsWith('.js')) {
+      parsed.pathname = `${parsed.pathname}.map`
+      return parsed.href
+    }
+    return undefined
   } catch {
     return undefined
   }
+}
+
+interface ClientModulesIntrospection {
+  manifest?: {
+    modules?: ReadonlyArray<{ id: string; url: string; initialUrl: string; rev: string }>
+  }
+  executedBundleUrls?: ReadonlySet<string>
+}
+
+interface DshBootGlobal {
+  __DSH_BOOT__?: {
+    batches?: ReadonlyArray<{ phase: string; url: string; rev: string; entries: readonly string[] }>
+    entries?: ReadonlyArray<{ id: string; url: string; rev: string }>
+  }
+}
+
+/**
+ * Collect candidate `.map` URLs for a stack frame filename.
+ * Handles both full combo URLs (`dsh-app://app/plugins/??...`) and query-stripped
+ * `/plugins/` frame filenames by reading active combo URLs from `ctx.modules` and `window.__DSH_BOOT__`.
+ */
+function candidateMapUrlsForFrame(ctx: Context, frameFilename: string): string[] {
+  const direct = scriptUrlToMapUrl(frameFilename)
+  if (direct !== undefined) return [direct]
+
+  // If the frame filename is `.../plugins/` with its `??...` query stripped:
+  if (frameFilename.endsWith('/plugins/') || frameFilename.endsWith('/plugins')) {
+    const candidates: string[] = []
+    const seen = new Set<string>()
+    const addCandidate = (rawUrl: string): void => {
+      const mapUrl = scriptUrlToMapUrl(rawUrl)
+      if (mapUrl !== undefined && !seen.has(mapUrl)) {
+        seen.add(mapUrl)
+        candidates.push(mapUrl)
+      }
+    }
+
+    const modulesSvc = ctx.get('modules' as never) as ClientModulesIntrospection | undefined
+    if (modulesSvc?.executedBundleUrls) {
+      // Check most recently executed bundles first (e.g. HMR reload or application batch).
+      for (const executed of [...modulesSvc.executedBundleUrls].reverse()) {
+        addCandidate(executed)
+      }
+    }
+    const boot = (globalThis as unknown as DshBootGlobal).__DSH_BOOT__
+    for (const batch of boot?.batches ?? []) {
+      if (batch.phase === 'application') addCandidate(batch.url)
+    }
+    for (const batch of boot?.batches ?? []) {
+      addCandidate(batch.url)
+    }
+    for (const row of modulesSvc?.manifest?.modules ?? []) {
+      if (row.id === PACKAGE_NAME) {
+        addCandidate(row.initialUrl)
+        addCandidate(row.url)
+      }
+    }
+    return candidates
+  }
+
+  return []
 }
 
 export function apply(ctx: Context): void {
@@ -113,9 +182,7 @@ export function apply(ctx: Context): void {
   const sourceMapPromises = new Map<string, Promise<CompiledSourceMap | null>>()
   const sourceMapSyncCache = new Map<string, CompiledSourceMap | null>()
 
-  const loadClientSourceMap = (scriptUrl: string): Promise<CompiledSourceMap | null> => {
-    const mapUrl = toSourceMapUrl(scriptUrl)
-    if (mapUrl === undefined) return Promise.resolve(null)
+  const fetchSourceMapByUrl = (mapUrl: string): Promise<CompiledSourceMap | null> => {
     const existing = sourceMapPromises.get(mapUrl)
     if (existing !== undefined) return existing
     const task = (async (): Promise<CompiledSourceMap | null> => {
@@ -138,6 +205,24 @@ export function apply(ctx: Context): void {
     return task
   }
 
+  const resolveClientPosition = async (
+    filename: string,
+    lineno: number,
+    colno: number,
+  ): Promise<ResolvedOriginalPosition | undefined> => {
+    const mapUrls = candidateMapUrlsForFrame(ctx, filename)
+    for (const mapUrl of mapUrls) {
+      const cached = sourceMapSyncCache.get(mapUrl)
+      const map = cached !== undefined ? cached : await fetchSourceMapByUrl(mapUrl)
+      if (map === null) continue
+      const resolved = map.lookup(lineno, colno)
+      if (resolved !== undefined && !resolved.source.startsWith('plugins/??')) {
+        return resolved
+      }
+    }
+    return undefined
+  }
+
   /** Enrich all exception frames on a Client Sentry Event using same-origin `.map` files. */
   const enrichClientEvent = async (event: Event): Promise<Event> => {
     const frames = collectEventFrames(event)
@@ -145,9 +230,7 @@ export function apply(ctx: Context): void {
     await Promise.all(
       frames.map(async (frame) => {
         if (!frame.filename || typeof frame.lineno !== 'number') return
-        const map = await loadClientSourceMap(frame.filename)
-        if (map === null) return
-        const resolved = map.lookup(frame.lineno, frame.colno ?? 1)
+        const resolved = await resolveClientPosition(frame.filename, frame.lineno, frame.colno ?? 1)
         if (resolved !== undefined) {
           applyResolvedToFrame(frame, resolved)
         }
@@ -160,40 +243,22 @@ export function apply(ctx: Context): void {
   const attachCallerSourceToSpan = async (span: Span, stack: string | undefined): Promise<void> => {
     if (!stack) return
     const parsedFrames = defaultStackParser(stack)
-    const callerFrame = parsedFrames.find((f) => {
-      const fn = f.function ?? ''
-      const file = f.filename ?? ''
-      if (!file || typeof f.lineno !== 'number') return false
-      if (fn.includes('connection.rpc.call') || fn.includes('attachCallerSourceToSpan')) return false
-      if (file.includes('@sentry')) return false
-      return true
-    }) ?? parsedFrames[0]
-
-    if (!callerFrame?.filename || typeof callerFrame.lineno !== 'number') return
-
-    const mapUrl = toSourceMapUrl(callerFrame.filename)
-    let map = mapUrl !== undefined ? sourceMapSyncCache.get(mapUrl) : null
-    if (map === undefined) {
-      map = await loadClientSourceMap(callerFrame.filename)
-    }
-    const resolved: ResolvedOriginalPosition | undefined = map?.lookup(
-      callerFrame.lineno,
-      callerFrame.colno ?? 1,
-    )
-    if (resolved !== undefined) {
-      span.setAttribute('code.filepath', resolved.source)
-      span.setAttribute('code.lineno', resolved.line)
-      span.setAttribute('code.column', resolved.column)
-      if (resolved.name || callerFrame.function) {
-        span.setAttribute('code.function', resolved.name ?? callerFrame.function!)
+    for (const frame of parsedFrames) {
+      if (!frame.filename || typeof frame.lineno !== 'number') continue
+      const resolved = await resolveClientPosition(frame.filename, frame.lineno, frame.colno ?? 1)
+      if (resolved !== undefined) {
+        if (resolved.source.includes('node_modules') || resolved.source.includes('@sentry')) continue
+        span.setAttribute('code.filepath', resolved.source)
+        span.setAttribute('code.lineno', resolved.line)
+        span.setAttribute('code.column', resolved.column)
+        if (resolved.name || frame.function) {
+          span.setAttribute('code.function', resolved.name ?? frame.function!)
+        }
+        if (resolved.contextLine) {
+          span.setAttribute('code.snippet', resolved.contextLine.trim())
+        }
+        return
       }
-      if (resolved.contextLine) {
-        span.setAttribute('code.snippet', resolved.contextLine.trim())
-      }
-    } else {
-      span.setAttribute('code.filepath', callerFrame.filename)
-      span.setAttribute('code.lineno', callerFrame.lineno)
-      if (callerFrame.function) span.setAttribute('code.function', callerFrame.function)
     }
   }
 

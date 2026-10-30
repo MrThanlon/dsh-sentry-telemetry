@@ -251,8 +251,8 @@ export function cleanSourcePath(rawPath: string): string {
   if (vendorIdx >= 0) return normalized.slice(vendorIdx + 1)
   const appsIdx = normalized.indexOf('/apps/')
   if (appsIdx >= 0) return normalized.slice(appsIdx + 1)
-  while (normalized.startsWith('../') || normalized.startsWith('./')) {
-    normalized = normalized.replace(/^\.\.?\//, '')
+  while (normalized.startsWith('../') || normalized.startsWith('./') || normalized.startsWith('/')) {
+    normalized = normalized.replace(/^(?:\.\.?\/|\/)/, '')
   }
   return normalized
 }
@@ -266,12 +266,14 @@ export function isAppFrame(path: string): boolean {
   return true
 }
 
-/** Apply a ResolvedOriginalPosition to a Sentry StackFrame in place. */
+/**
+ * Apply a ResolvedOriginalPosition to a Sentry StackFrame in place.
+ * Sets BOTH `filename` and `abs_path` to the resolved source path so Sentry's
+ * server displays the de-minified TypeScript path instead of the raw bundle URL.
+ */
 export function applyResolvedToFrame(frame: StackFrame, resolved: ResolvedOriginalPosition): void {
-  if (frame.filename && !frame.abs_path) {
-    frame.abs_path = frame.filename
-  }
   frame.filename = resolved.source
+  frame.abs_path = resolved.source
   frame.lineno = resolved.line
   frame.colno = resolved.column
   if (resolved.name && (!frame.function || frame.function === '?' || frame.function === '<anonymous>')) {
