@@ -3,6 +3,9 @@
  *
  * - Reads and edits `sentry-telemetry` settings live via `ctx.configForms`.
  * - Initializes `@sentry/browser` (`BrowserClient`) dynamically when DSN is configured.
+ * - Resolves same-origin Source Map v3 (including DSH's Indexed Combo Source Maps) in-browser
+ *   so every Error frame and Trace Span sent to Sentry carries original `.ts`/`.tsx` file paths,
+ *   exact line numbers, and `pre_context`/`context_line`/`post_context` source code snippets.
  * - Captures React Slot/Factory crashes contained by `SlotErrorBoundary` (`ctx.slots.onEntryError`).
  * - Captures Client Cordis `ctx.logger.error` records and browser unhandled errors/rejections.
  * - Wraps `ctx.connection.rpc.call` to record `rpc.client` spans, propagate `sentry-trace` and
@@ -33,12 +36,21 @@ import {
   setCurrentClient,
   startSpan,
   withScope,
+  type Event,
 } from '@sentry/browser'
 import {
   SPAN_STATUS_ERROR,
   SPAN_STATUS_OK,
   dsnFromString,
+  type Span,
 } from '@sentry/core'
+import {
+  applyResolvedToFrame,
+  collectEventFrames,
+  compileSourceMap,
+  type CompiledSourceMap,
+  type ResolvedOriginalPosition,
+} from '../sourcemap.ts'
 import {
   DEFAULT_SENTRY_CONFIG,
   ENTRY_ID,
@@ -77,11 +89,113 @@ function toError(value: unknown): Error {
   return new Error(typeof value === 'string' ? value : JSON.stringify(value))
 }
 
+/** Derive the `.map` endpoint URL for a DSH `/plugins/...` or Vite `/assets/...` script URL. */
+function toSourceMapUrl(scriptUrl: string): string | undefined {
+  try {
+    const baseOrigin = typeof location !== 'undefined' ? location.origin : 'http://127.0.0.1'
+    const parsed = new URL(scriptUrl, baseOrigin)
+    if (typeof location !== 'undefined' && parsed.origin !== location.origin) return undefined
+    if (!parsed.pathname.endsWith('.js')) return undefined
+    parsed.pathname = `${parsed.pathname}.map`
+    return parsed.href
+  } catch {
+    return undefined
+  }
+}
+
 export function apply(ctx: Context): void {
   const { slots, locale, configForms } = ctx
   const connection = ctx.get('connection') as unknown as ConnectionHandle
 
   const formScope = configForms.get<SentryConfigValues>(ENTRY_ID)
+  const rawFetch = globalThis.fetch.bind(globalThis)
+
+  const sourceMapPromises = new Map<string, Promise<CompiledSourceMap | null>>()
+  const sourceMapSyncCache = new Map<string, CompiledSourceMap | null>()
+
+  const loadClientSourceMap = (scriptUrl: string): Promise<CompiledSourceMap | null> => {
+    const mapUrl = toSourceMapUrl(scriptUrl)
+    if (mapUrl === undefined) return Promise.resolve(null)
+    const existing = sourceMapPromises.get(mapUrl)
+    if (existing !== undefined) return existing
+    const task = (async (): Promise<CompiledSourceMap | null> => {
+      try {
+        const res = await rawFetch(mapUrl)
+        if (!res.ok) {
+          sourceMapSyncCache.set(mapUrl, null)
+          return null
+        }
+        const json: unknown = await res.json()
+        const compiled = compileSourceMap(json) ?? null
+        sourceMapSyncCache.set(mapUrl, compiled)
+        return compiled
+      } catch {
+        sourceMapSyncCache.set(mapUrl, null)
+        return null
+      }
+    })()
+    sourceMapPromises.set(mapUrl, task)
+    return task
+  }
+
+  /** Enrich all exception frames on a Client Sentry Event using same-origin `.map` files. */
+  const enrichClientEvent = async (event: Event): Promise<Event> => {
+    const frames = collectEventFrames(event)
+    if (frames.length === 0) return event
+    await Promise.all(
+      frames.map(async (frame) => {
+        if (!frame.filename || typeof frame.lineno !== 'number') return
+        const map = await loadClientSourceMap(frame.filename)
+        if (map === null) return
+        const resolved = map.lookup(frame.lineno, frame.colno ?? 1)
+        if (resolved !== undefined) {
+          applyResolvedToFrame(frame, resolved)
+        }
+      }),
+    )
+    return event
+  }
+
+  /** Capture and resolve the caller's original TypeScript source position for a Trace Span. */
+  const attachCallerSourceToSpan = async (span: Span, stack: string | undefined): Promise<void> => {
+    if (!stack) return
+    const parsedFrames = defaultStackParser(stack)
+    const callerFrame = parsedFrames.find((f) => {
+      const fn = f.function ?? ''
+      const file = f.filename ?? ''
+      if (!file || typeof f.lineno !== 'number') return false
+      if (fn.includes('connection.rpc.call') || fn.includes('attachCallerSourceToSpan')) return false
+      if (file.includes('@sentry')) return false
+      return true
+    }) ?? parsedFrames[0]
+
+    if (!callerFrame?.filename || typeof callerFrame.lineno !== 'number') return
+
+    const mapUrl = toSourceMapUrl(callerFrame.filename)
+    let map = mapUrl !== undefined ? sourceMapSyncCache.get(mapUrl) : null
+    if (map === undefined) {
+      map = await loadClientSourceMap(callerFrame.filename)
+    }
+    const resolved: ResolvedOriginalPosition | undefined = map?.lookup(
+      callerFrame.lineno,
+      callerFrame.colno ?? 1,
+    )
+    if (resolved !== undefined) {
+      span.setAttribute('code.filepath', resolved.source)
+      span.setAttribute('code.lineno', resolved.line)
+      span.setAttribute('code.column', resolved.column)
+      if (resolved.name || callerFrame.function) {
+        span.setAttribute('code.function', resolved.name ?? callerFrame.function!)
+      }
+      if (resolved.contextLine) {
+        span.setAttribute('code.snippet', resolved.contextLine.trim())
+      }
+    } else {
+      span.setAttribute('code.filepath', callerFrame.filename)
+      span.setAttribute('code.lineno', callerFrame.lineno)
+      if (callerFrame.function) span.setAttribute('code.function', callerFrame.function)
+    }
+  }
 
   let activeClient: BrowserClient | undefined
   let activeSignature = ''
@@ -127,6 +241,7 @@ export function apply(ctx: Context): void {
           httpContextIntegration(),
         ],
       })
+      client.addEventProcessor(event => enrichClientEvent(event))
       setCurrentClient(client)
       client.init()
       activeClient = client
@@ -209,6 +324,7 @@ export function apply(ctx: Context): void {
       if (!isCollecting()) {
         return await originalRpcCall(channel, endpoint, payload, signal)
       }
+      const callerStack = new Error().stack
       return await startSpan(
         {
           name: `rpc ${channel}/${endpoint}`,
@@ -221,6 +337,7 @@ export function apply(ctx: Context): void {
           },
         },
         async (span) => {
+          await attachCallerSourceToSpan(span, callerStack).catch(() => {})
           try {
             const result = await originalRpcCall(channel, endpoint, payload, signal)
             if (!result.ok) {
@@ -283,6 +400,7 @@ export function apply(ctx: Context): void {
   const sendTestTelemetry = (): void => {
     if (!isCollecting()) return
     safe(() => {
+      const callerStack = new Error().stack
       void startSpan(
         {
           name: 'dsh.sentry.test_trace',
@@ -292,7 +410,8 @@ export function apply(ctx: Context): void {
             'dsh.plugin': PACKAGE_NAME,
           },
         },
-        async () => {
+        async (span) => {
+          await attachCallerSourceToSpan(span, callerStack).catch(() => {})
           withScope((scope) => {
             scope.setTag('dsh.side', 'client')
             scope.setTag('dsh.source', 'settings.test_button')

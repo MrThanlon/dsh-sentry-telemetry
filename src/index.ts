@@ -3,13 +3,17 @@
  *
  * Captures Host-side errors across DSH's containment boundaries (Cordis logger,
  * Agent Loop, LLM streaming, Tool pipeline, Typert Gateway RPC, and fatal
- * process exits) and records distributed traces (HTTP/RPC -> Turn -> Step ->
- * LLM / Tool spans) into Sentry.
+ * process exits), resolves local Source Maps & source context lines for stack
+ * frames, and records distributed traces (HTTP/RPC -> Turn -> Step -> LLM / Tool
+ * spans) into Sentry.
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { hostname } from 'node:os'
+import { dirname, resolve as resolvePath } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context, LoggerLevel } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-agent'
@@ -47,9 +51,20 @@ import {
   withActiveSpan,
   withScope,
   type BaseTransportOptions,
+  type Event,
   type Span,
+  type StackFrame,
   type Transport,
 } from '@sentry/core'
+import {
+  applyResolvedToFrame,
+  cleanSourcePath,
+  collectEventFrames,
+  compileSourceMap,
+  extractContextFromLines,
+  isAppFrame,
+  type CompiledSourceMap,
+} from './sourcemap.ts'
 import {
   DEFAULT_SENTRY_CONFIG,
   readConfigValues,
@@ -79,6 +94,11 @@ let asyncStrategyInstalled = false
 function ensureNodeAsyncContextStrategy(): void {
   if (asyncStrategyInstalled) return
   asyncStrategyInstalled = true
+  try {
+    process.setSourceMapsEnabled?.(true)
+  } catch {
+    // Ignore if unavailable in constrained environments.
+  }
   const storage = new AsyncLocalStorage<AsyncStore>()
   const defaultScope = new Scope()
   const defaultIsolationScope = new Scope()
@@ -112,6 +132,110 @@ function ensureNodeAsyncContextStrategy(): void {
       return storage.run({ scope: current.scope, isolationScope }, () => callback(isolationScope))
     },
   })
+}
+
+const hostSourceMapCache = new Map<string, CompiledSourceMap | null>()
+const hostFileLinesCache = new Map<string, readonly string[] | null>()
+
+function toFilesystemPath(filename: string): string | undefined {
+  if (!filename || filename.startsWith('node:') || filename.startsWith('internal/')) return undefined
+  if (filename.startsWith('file://')) {
+    try {
+      return fileURLToPath(filename)
+    } catch {
+      return undefined
+    }
+  }
+  return filename
+}
+
+function readHostFileLines(filePath: string): readonly string[] | undefined {
+  const cached = hostFileLinesCache.get(filePath)
+  if (cached !== undefined) return cached ?? undefined
+  try {
+    if (!existsSync(filePath)) {
+      hostFileLinesCache.set(filePath, null)
+      return undefined
+    }
+    const content = readFileSync(filePath, 'utf8')
+    const lines = content.split(/\r?\n/)
+    hostFileLinesCache.set(filePath, lines)
+    return lines
+  } catch {
+    hostFileLinesCache.set(filePath, null)
+    return undefined
+  }
+}
+
+function loadHostSourceMap(filePath: string): CompiledSourceMap | undefined {
+  const cached = hostSourceMapCache.get(filePath)
+  if (cached !== undefined) return cached ?? undefined
+  const mapPath = `${filePath}.map`
+  try {
+    if (!existsSync(mapPath)) {
+      hostSourceMapCache.set(filePath, null)
+      return undefined
+    }
+    const raw = JSON.parse(readFileSync(mapPath, 'utf8')) as unknown
+    const compiled = compileSourceMap(raw) ?? null
+    hostSourceMapCache.set(filePath, compiled)
+    return compiled ?? undefined
+  } catch {
+    hostSourceMapCache.set(filePath, null)
+    return undefined
+  }
+}
+
+/** Enrich a Host StackFrame using its adjacent `.map` file or direct file context lines. */
+function enrichHostStackFrame(frame: StackFrame): void {
+  if (!frame.filename || typeof frame.lineno !== 'number') return
+  const fsPath = toFilesystemPath(frame.filename)
+  if (!fsPath) return
+
+  const sourceMap = loadHostSourceMap(fsPath)
+  if (sourceMap !== undefined) {
+    const resolved = sourceMap.lookup(frame.lineno, frame.colno ?? 1)
+    if (resolved !== undefined) {
+      applyResolvedToFrame(frame, resolved)
+      if (frame.context_line === undefined) {
+        const candidateSource = resolvePath(dirname(fsPath), resolved.source)
+        const lines = readHostFileLines(candidateSource)
+        const context = lines !== undefined ? extractContextFromLines(lines, resolved.line) : undefined
+        if (context !== undefined) {
+          frame.pre_context = context.preContext
+          frame.context_line = context.contextLine
+          frame.post_context = context.postContext
+        }
+      }
+      return
+    }
+  }
+
+  // Fallback: read context lines directly from the file on disk (e.g. `.ts` or readable ESM `.js`).
+  const lines = readHostFileLines(fsPath)
+  if (lines !== undefined && frame.context_line === undefined) {
+    const context = extractContextFromLines(lines, frame.lineno)
+    if (context !== undefined) {
+      frame.pre_context = context.preContext
+      frame.context_line = context.contextLine
+      frame.post_context = context.postContext
+    }
+  }
+  frame.abs_path ??= frame.filename
+  frame.filename = cleanSourcePath(fsPath)
+  frame.in_app = isAppFrame(frame.filename)
+}
+
+/** Enrich all exception frames on a Host Sentry Event. */
+function enrichHostEvent(event: Event): Event {
+  for (const frame of collectEventFrames(event)) {
+    try {
+      enrichHostStackFrame(frame)
+    } catch {
+      // Ignore individual frame resolution errors.
+    }
+  }
+  return event
 }
 
 /** Create a Sentry transport using Node's global fetch (which honors DSH's HTTP proxy dispatcher). */
@@ -213,6 +337,7 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
           extraErrorDataIntegration(),
         ],
       })
+      client.addEventProcessor(event => enrichHostEvent(event))
       setCurrentClient(client)
       client.init()
       activeClient = client
@@ -339,6 +464,8 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
               'dsh.side': 'host',
               'session.id': sessionId,
               'turn.number': turn,
+              'code.filepath': 'packages/core/agent-loop/src/agent.ts',
+              'code.function': 'AgentImpl.turn',
             },
           })
           turnSpans.set(key, span)
@@ -359,6 +486,8 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
                 'session.id': sessionId,
                 'turn.number': turn,
                 'step.number': step,
+                'code.filepath': 'packages/core/agent-loop/src/agent.ts',
+                'code.function': 'AgentImpl.step',
               },
             })
           const span = turnSpan !== undefined ? withActiveSpan(turnSpan, createStep) : createStep()
@@ -450,6 +579,8 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
           'dsh.side': 'host',
           'gen_ai.system': options.provider,
           'gen_ai.request.model': options.model,
+          'code.filepath': 'packages/llm/llm/src/index.ts',
+          'code.function': 'LlmRuntime.stream',
           ...(sessionId === undefined ? {} : { 'session.id': sessionId }),
         },
       })
@@ -488,6 +619,8 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
             'dsh.side': 'host',
             'gen_ai.tool.name': exec.name,
             'gen_ai.tool.call_id': String(exec.callId),
+            'code.filepath': 'packages/core/tools/src/pipeline.ts',
+            'code.function': `tool.${exec.name}`,
             ...(sessionId === undefined ? {} : { 'session.id': sessionId }),
             ...(agentId === undefined ? {} : { 'agent.id': agentId }),
           },
@@ -535,6 +668,7 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
     const baggage = Array.isArray(baggageHeader) ? baggageHeader.join(',') : baggageHeader
     const method = request.method ?? 'POST'
     const urlPath = (request.url ?? '/api').split('?')[0] ?? '/api'
+    const endpointName = urlPath.startsWith('/api/') ? urlPath.slice('/api/'.length) : urlPath
 
     return await continueTrace({ sentryTrace, baggage }, async () =>
       await startSpan(
@@ -546,6 +680,8 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
             'dsh.side': 'host',
             'http.request.method': method,
             'url.path': urlPath,
+            'code.filepath': 'packages/api/gateway/src/index.ts',
+            'code.function': endpointName,
           },
         },
         async (span) => {
@@ -591,8 +727,6 @@ export function apply(ctx: Context, rawConfig: ResolvedSentryConfig): void {
         } catch (error) {
           if (isCollecting() && currentSettings.captureRpcErrors) {
             safe(() => {
-              // Business RemoteError instances carry a string `code` and `details` object;
-              // capture unexpected internal Error throws with their full Host stack.
               const isExpectedRemoteError = typeof error === 'object'
                 && error !== null
                 && 'code' in error

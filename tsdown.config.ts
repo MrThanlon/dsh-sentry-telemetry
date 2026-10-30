@@ -31,9 +31,13 @@ export default defineConfig([
     target: 'es2024',
     fixedExtension: false,
     dts: true,
+    sourcemap: true,
     clean: true,
     define: {
       __SENTRY_DEBUG__: 'false',
+    },
+    outputOptions: {
+      sourcemapExcludeSources: false,
     },
     deps: {
       onlyBundle: false,
@@ -50,6 +54,7 @@ export default defineConfig([
     target: 'es2024',
     fixedExtension: false,
     dts: false,
+    sourcemap: true,
     clean: false,
     define: {
       'process.env.NODE_ENV': JSON.stringify('production'),
@@ -62,6 +67,7 @@ export default defineConfig([
     },
     outputOptions: {
       entryFileNames: 'client.js',
+      sourcemapExcludeSources: false,
       banner: () => `window.__ModuleLoader__.load({ id: ${JSON.stringify(PACKAGE_ID)}, factory: (require) => {`,
       intro: 'var module = { exports: {} }; var exports = module.exports;',
       footer: 'return module.exports; } });',
