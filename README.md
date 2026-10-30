@@ -1,4 +1,4 @@
-# @local/dsh-sentry-telemetry
+# dsh-sentry-telemetry
 
 Dual-face (Host + Web Client) Sentry error & distributed trace telemetry plugin for DeepSeek Harness.
 
