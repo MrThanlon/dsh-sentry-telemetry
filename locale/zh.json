@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sentry 遥测监控",
+    "description": "收集 Host 与 Web Client 双端被兜底的错误及全链路 Trace（RPC、Agent Turn/Step、LLM 流与 Tool 调用）并上报至 Sentry，支持在插件设置中实时配置 DSN。"
+  }
+}

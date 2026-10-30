@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sentry Telemetry",
+    "description": "Captures Host and Web Client errors and distributed traces (RPC, Agent turns, steps, LLM streams, and tools) into Sentry with live DSN configuration."
+  }
+}

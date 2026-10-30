@@ -1,0 +1,11 @@
+- insert:
+    - id: sentry-telemetry
+      name: 'dsh-sentry-telemetry'
+      config:
+        enabled: true
+        dsn: ''
+        clientDsn: ''
+        environment: production
+        tracesSampleRate: 1
+        captureToolErrors: true
+        captureRpcErrors: true
